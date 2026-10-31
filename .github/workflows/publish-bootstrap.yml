@@ -1,0 +1,23 @@
+name: publish-bootstrap
+on: workflow_dispatch
+permissions:
+  packages: write
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: create public package placeholders
+        run: |
+          set -eux
+          # Packages first published from this workflow's GITHUB_TOKEN inherit
+          # the repository's visibility (public). Push a 1-byte placeholder tag
+          # under each final package name so the packages are created public;
+          # the real image layers are pushed on top from the build machine.
+          echo placeholder > f
+          printf 'FROM scratch\nCOPY f /\n' > Dockerfile
+          docker build -t ghcr.io/${{ github.repository_owner }}/glm53-vision-serve:bootstrap .
+          docker tag ghcr.io/${{ github.repository_owner }}/glm53-vision-serve:bootstrap \
+                     ghcr.io/${{ github.repository_owner }}/glm53-vision-runtime:bootstrap
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push ghcr.io/${{ github.repository_owner }}/glm53-vision-serve:bootstrap
+          docker push ghcr.io/${{ github.repository_owner }}/glm53-vision-runtime:bootstrap
