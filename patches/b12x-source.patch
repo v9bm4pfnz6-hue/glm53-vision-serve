@@ -1,0 +1,1060 @@
+diff --git a/b12x/attention/_shared/mla/api.py b/b12x/attention/_shared/mla/api.py
+index cc4fe8e5..3a913fbe 100644
+--- a/b12x/attention/_shared/mla/api.py
++++ b/b12x/attention/_shared/mla/api.py
+@@ -222,9 +222,10 @@ def _get_mla_output_view(
+         raise ValueError(
+             f"workspace MLA output buffer is on {output_buffer.device}, expected {q_all.device}"
+         )
+-    if output_buffer.dtype != q_all.dtype:
++    if output_buffer.dtype not in (q_all.dtype, torch.float32):
+         raise TypeError(
+-            f"workspace MLA output buffer has dtype {output_buffer.dtype}, expected {q_all.dtype}"
++            "workspace MLA output buffer must have query dtype or float32, "
++            f"got {output_buffer.dtype} for query {q_all.dtype}"
+         )
+     if output_buffer.ndim != 3:
+         raise ValueError(
+diff --git a/b12x/attention/_shared/mla/kernel.py b/b12x/attention/_shared/mla/kernel.py
+index def97e31..9e812a98 100644
+--- a/b12x/attention/_shared/mla/kernel.py
++++ b/b12x/attention/_shared/mla/kernel.py
+@@ -3499,9 +3499,9 @@ def run_unified_decode(
+                 f"SM120 sparse MLA decode out must have shape "
+                 f"{(rows, heads, d_v)}, got {tuple(out.shape)}"
+             )
+-        if out.dtype != torch.bfloat16:
++        if out.dtype not in (torch.bfloat16, torch.float32):
+             raise TypeError(
+-                f"SM120 sparse MLA decode out must be bfloat16, got {out.dtype}"
++                f"SM120 sparse MLA decode out must be bf16 or fp32, got {out.dtype}"
+             )
+         if out.device != q_all.device:
+             raise ValueError(
+diff --git a/b12x/attention/_shared/mla/prefill_mg.py b/b12x/attention/_shared/mla/prefill_mg.py
+index 411da242..aa845313 100644
+--- a/b12x/attention/_shared/mla/prefill_mg.py
++++ b/b12x/attention/_shared/mla/prefill_mg.py
+@@ -3604,7 +3604,9 @@ class UnifiedPrefillMGKernel:
+                 num_threads=self.math_threads,
+                 barrier_id=3,
+                 coalesced_output=cutlass.const_expr(
+-                    self.output_stride_dim == 1 and self.output_stride_head == t.d_v
++                    output.element_type == cutlass.BFloat16
++                    and self.output_stride_dim == 1
++                    and self.output_stride_head == t.d_v
+                 ),
+             )
+ 
+@@ -3668,7 +3670,9 @@ class UnifiedPrefillMGKernel:
+                     num_threads=self.math_threads,
+                     barrier_id=3,
+                     coalesced_output=cutlass.const_expr(
+-                        self.output_stride_dim == 1 and self.output_stride_head == t.d_v
++                        output.element_type == cutlass.BFloat16
++                        and self.output_stride_dim == 1
++                        and self.output_stride_head == t.d_v
+                     ),
+                 )
+ 
+@@ -3789,7 +3793,12 @@ def _sparse_mla_prefill_mg_flat_launch(
+         _to_cute(topk_indices, cutlass.Int32, align=4, dynamic_layout=True),
+         _to_cute(topk_length, cutlass.Int32, align=4, dynamic_layout=True),
+         _to_cute(attn_sink_t, cutlass.Float32, align=4),
+-        _to_cute(output, cutlass.BFloat16, align=16, dynamic_layout=True),
++        _to_cute(
++            output,
++            cutlass.Float32 if output.dtype == torch.float32 else cutlass.BFloat16,
++            align=16,
++            dynamic_layout=True,
++        ),
+         _to_cute(lse_out, cutlass.Float32, align=4, dynamic_layout=True),
+         Float32(float(sm_scale) * LOG2_E),
+         Float32(float(latent_scale)),
+diff --git a/b12x/attention/sparse_mla/_scratch.py b/b12x/attention/sparse_mla/_scratch.py
+index a727ee07..098a0d36 100644
+--- a/b12x/attention/sparse_mla/_scratch.py
++++ b/b12x/attention/sparse_mla/_scratch.py
+@@ -59,6 +59,7 @@ class B12XSparseMLAScratchCaps:
+     # keeps the partials exact so the merged result is rounded once, at the
+     # output. Prefill-like modes have no partials and ignore this field.
+     partial_dtype: torch.dtype | None = None
++    output_dtype: torch.dtype | None = None
+ 
+     def __post_init__(self) -> None:
+         device = torch.device(self.device)
+@@ -98,6 +99,13 @@ class B12XSparseMLAScratchCaps:
+                 f"got {partial_dtype}"
+             )
+         object.__setattr__(self, "partial_dtype", partial_dtype)
++        output_dtype = self.dtype if self.output_dtype is None else self.output_dtype
++        if output_dtype not in (self.dtype, torch.float32):
++            raise TypeError(
++                "output_dtype must be the activation dtype or torch.float32, "
++                f"got {output_dtype}"
++            )
++        object.__setattr__(self, "output_dtype", output_dtype)
+ 
+ 
+ @dataclass(kw_only=True)
+@@ -370,10 +378,10 @@ def _sparse_mla_scratch_layout(
+             * v_head_dim
+             * dtype_nbytes(caps.partial_dtype)
+         )
+-        if caps.partial_dtype != caps.dtype:
++        if caps.partial_dtype != caps.output_dtype:
+             cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+             output_offset_bytes = cursor
+-            cursor += max_total_q * num_q_heads * v_head_dim * dtype_nbytes(caps.dtype)
++            cursor += max_total_q * num_q_heads * v_head_dim * dtype_nbytes(caps.output_dtype)
+         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+         tmp_lse_offset_bytes = cursor
+         cursor += (
+@@ -392,7 +400,7 @@ def _sparse_mla_scratch_layout(
+     else:
+         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+         output_offset_bytes = cursor
+-        cursor += max_total_q * num_q_heads * v_head_dim * dtype_nbytes(caps.dtype)
++        cursor += max_total_q * num_q_heads * v_head_dim * dtype_nbytes(caps.output_dtype)
+         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+ 
+     sm_scale_offset_bytes = cursor
+@@ -441,7 +449,7 @@ def _materialize_sparse_mla_scratch(
+             ),
+             dtype=caps.partial_dtype,
+         )
+-        if caps.partial_dtype == caps.dtype:
++        if caps.partial_dtype == caps.output_dtype:
+             output_buffer = _split_output_buffer_from_tmp(
+                 tmp_output,
+                 head_major_output=caps.head_major_output,
+@@ -452,14 +460,14 @@ def _materialize_sparse_mla_scratch(
+                 offset_bytes=layout.output_offset_bytes,
+                 shape=(max_total_q, num_q_heads, v_head_dim),
+                 stride=(v_head_dim, max_total_q * v_head_dim, 1),
+-                dtype=caps.dtype,
++                dtype=caps.output_dtype,
+             )
+         else:
+             output_buffer, _ = materialize_scratch_view(
+                 scratch_storage,
+                 offset_bytes=layout.output_offset_bytes,
+                 shape=(max_total_q, num_q_heads, v_head_dim),
+-                dtype=caps.dtype,
++                dtype=caps.output_dtype,
+             )
+         tmp_lse, _ = materialize_scratch_view(
+             scratch_storage,
+@@ -492,14 +500,14 @@ def _materialize_sparse_mla_scratch(
+                 offset_bytes=layout.output_offset_bytes,
+                 shape=(max_total_q, num_q_heads, v_head_dim),
+                 stride=(v_head_dim, max_total_q * v_head_dim, 1),
+-                dtype=caps.dtype,
++                dtype=caps.output_dtype,
+             )
+         else:
+             output_buffer, _ = materialize_scratch_view(
+                 scratch_storage,
+                 offset_bytes=layout.output_offset_bytes,
+                 shape=(max_total_q, num_q_heads, v_head_dim),
+-                dtype=caps.dtype,
++                dtype=caps.output_dtype,
+             )
+ 
+     sm_scale_tensor, _ = materialize_scratch_view(
+diff --git a/b12x/comm/pcie/_dcp_a2a_cute.py b/b12x/comm/pcie/_dcp_a2a_cute.py
+index 25d7df94..e195ed18 100644
+--- a/b12x/comm/pcie/_dcp_a2a_cute.py
++++ b/b12x/comm/pcie/_dcp_a2a_cute.py
+@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
+ import cuda.bindings.driver as cuda
+ import cutlass
+ import cutlass.cute as cute
+-from cutlass import Float32, Int32, Int64, Uint8, Uint32
++from cutlass import Float32, Float64, Int32, Int64, Uint8, Uint32
+ from cutlass.cutlass_dsl import T, dsl_user_op
+ from cutlass._mlir.dialects import llvm
+ 
+@@ -19,6 +19,7 @@ from b12x._lib.intrinsics import (
+     ld_global_nc_v4_u32,
+     ld_global_v4_u32,
+     st_global_f32,
++    st_global_v2_u32,
+     st_global_v4_u32,
+     u32_as_f32,
+ )
+@@ -27,6 +28,7 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
+ 
+ from ._dcp_cute_common import block_pair_barrier
+ from ._cute_intrinsics import (
++    f32_as_u32,
+     float_order_key,
+     redux_max_u32,
+     ld_generic_f32,
+@@ -224,6 +226,98 @@ def _fma_rn_f32(
+     )
+ 
+ 
++@dsl_user_op
++def _cvt_f64_f32(a: Float32, *, loc=None, ip=None) -> Float64:
++    """Exact widening of an fp32 value to fp64."""
++    return Float64(
++        llvm.inline_asm(
++            T.f64(),
++            [Float32(a).ir_value(loc=loc, ip=ip)],
++            "cvt.f64.f32 $0, $1;",
++            "=d,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def _fma_rn_f64(
++    a: Float64,
++    b: Float64,
++    c: Float64,
++    *,
++    loc=None,
++    ip=None,
++) -> Float64:
++    return Float64(
++        llvm.inline_asm(
++            T.f64(),
++            [
++                Float64(a).ir_value(loc=loc, ip=ip),
++                Float64(b).ir_value(loc=loc, ip=ip),
++                Float64(c).ir_value(loc=loc, ip=ip),
++            ],
++            "fma.rn.f64 $0, $1, $2, $3;",
++            "=d,d,d,d",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def _cvt_rn_f32_f64(a: Float64, *, loc=None, ip=None) -> Float32:
++    """Round an fp64 value to the nearest fp32."""
++    return Float32(
++        llvm.inline_asm(
++            T.f32(),
++            [Float64(a).ir_value(loc=loc, ip=ip)],
++            "cvt.rn.f32.f64 $0, $1;",
++            "=f,d",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def _pack_f64x2_to_bf16x2(lo: Float64, hi: Float64, *, loc=None, ip=None) -> Uint32:
++    """Round two fp64 values directly to bf16 (one rounding each) and pack."""
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                Float64(lo).ir_value(loc=loc, ip=ip),
++                Float64(hi).ir_value(loc=loc, ip=ip),
++            ],
++            """
++            {
++                .reg .b16 blo, bhi;
++                cvt.rn.bf16.f64 blo, $1;
++                cvt.rn.bf16.f64 bhi, $2;
++                mov.b32 $0, {blo, bhi};
++            }
++            """,
++            "=r,d,d",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
+ @dsl_user_op
+ def _ld_generic_v4_u32(
+     address: Int64,
+@@ -401,6 +495,10 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
+             push,
+         )
+         self._dtype_name = str(dtype_name)
++        # "fp32": FP32 partials, FP64 accumulation, one rounding to BF16.
++        # "fp32x32": the same accumulation written as FP32.
++        self._fp32_input = self._dtype_name in ("fp32", "fp32x32")
++        self._fp32_output = self._dtype_name == "fp32x32"
+ 
+     @cute.jit
+     def __call__(
+@@ -626,7 +724,11 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
+         )
+         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
+         heads_per_rank = total_heads // Int32(self._world_size)
+-        packs_per_head = head_dim // Int32(8)
++        # One pack is 16 bytes: eight 16-bit or four fp32 partial elements.
++        if cutlass.const_expr(self._fp32_input):
++            packs_per_head = head_dim // Int32(4)
++        else:
++            packs_per_head = head_dim // Int32(8)
+         rows = batch * heads_per_rank
+         # Keep the remote staging bases in their scalar launch parameters.
+         # Materializing all eight slot-adjusted pointers here keeps them live
+@@ -853,46 +955,91 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
+                 Int32(32),
+                 unroll=1,
+             ):
+-                accum = cute.make_rmem_tensor((8,), Float32)
+                 source_addresses = cute.make_rmem_tensor(
+                     (self._world_size,), Int64
+                 )
+-                for element in cutlass.range_constexpr(8):
+-                    accum[element] = Float32(0.0)
+                 for source_index in cutlass.range_constexpr(self._world_size):
+                     source_addresses[source_index] = (
+                         payload_row_addresses[source_index]
+                         + Int64(pack) * Int64(16)
+                     )
+-                for source_index in cutlass.range_constexpr(self._world_size):
+-                    normalized_weight = weights[source_index] * inv_weight_sum
+-                    if normalized_weight != Float32(0.0):
+-                        words = _ld_generic_v4_u32(
+-                            source_addresses[source_index]
+-                        )
+-                        for pair in cutlass.range_constexpr(4):
+-                            lo, hi = self._unpack_pair(words[pair])
+-                            accum[pair * 2] = _fma_rn_f32(
+-                                normalized_weight, lo, accum[pair * 2]
++                if cutlass.const_expr(self._fp32_input):
++                    # Four fp32 partial elements per pack. The weighted sum
++                    # over ranks accumulates in fp64 (every fp32 x fp32
++                    # product is exact in fp64) and rounds once on store.
++                    accum64 = cute.make_rmem_tensor((4,), Float64)
++                    for element in cutlass.range_constexpr(4):
++                        accum64[element] = Float64(0.0)
++                    for source_index in cutlass.range_constexpr(self._world_size):
++                        normalized_weight = weights[source_index] * inv_weight_sum
++                        if normalized_weight != Float32(0.0):
++                            words = _ld_generic_v4_u32(
++                                source_addresses[source_index]
+                             )
+-                            accum[pair * 2 + 1] = _fma_rn_f32(
+-                                normalized_weight, hi, accum[pair * 2 + 1]
++                            weight64 = _cvt_f64_f32(normalized_weight)
++                            for element in cutlass.range_constexpr(4):
++                                accum64[element] = _fma_rn_f64(
++                                    weight64,
++                                    _cvt_f64_f32(u32_as_f32(words[element])),
++                                    accum64[element],
++                                )
++                    if cutlass.const_expr(self._fp32_output):
++                        st_global_v4_u32(
++                            (
++                                output
++                                + output_base * Int64(4)
++                                + Int64(pack) * Int64(4)
++                            ).toint(),
++                            f32_as_u32(_cvt_rn_f32_f64(accum64[0])),
++                            f32_as_u32(_cvt_rn_f32_f64(accum64[1])),
++                            f32_as_u32(_cvt_rn_f32_f64(accum64[2])),
++                            f32_as_u32(_cvt_rn_f32_f64(accum64[3])),
++                        )
++                    else:
++                        # Output rows are bf16: a pack of four fp32 inputs
++                        # becomes eight bytes at half the pack offset.
++                        st_global_v2_u32(
++                            (
++                                output
++                                + output_base * Int64(4)
++                                + Int64(pack) * Int64(2)
++                            ).toint(),
++                            _pack_f64x2_to_bf16x2(accum64[0], accum64[1]),
++                            _pack_f64x2_to_bf16x2(accum64[2], accum64[3]),
++                        )
++                else:
++                    accum = cute.make_rmem_tensor((8,), Float32)
++                    for element in cutlass.range_constexpr(8):
++                        accum[element] = Float32(0.0)
++                    for source_index in cutlass.range_constexpr(self._world_size):
++                        normalized_weight = weights[source_index] * inv_weight_sum
++                        if normalized_weight != Float32(0.0):
++                            words = _ld_generic_v4_u32(
++                                source_addresses[source_index]
+                             )
+-                result0 = self._pack_pair(accum[0], accum[1])
+-                result1 = self._pack_pair(accum[2], accum[3])
+-                result2 = self._pack_pair(accum[4], accum[5])
+-                result3 = self._pack_pair(accum[6], accum[7])
+-                st_global_v4_u32(
+-                    (
+-                        output
+-                        + output_base * Int64(4)
+-                        + Int64(pack) * Int64(4)
+-                    ).toint(),
+-                    result0,
+-                    result1,
+-                    result2,
+-                    result3,
+-                )
++                            for pair in cutlass.range_constexpr(4):
++                                lo, hi = self._unpack_pair(words[pair])
++                                accum[pair * 2] = _fma_rn_f32(
++                                    normalized_weight, lo, accum[pair * 2]
++                                )
++                                accum[pair * 2 + 1] = _fma_rn_f32(
++                                    normalized_weight, hi, accum[pair * 2 + 1]
++                                )
++                    result0 = self._pack_pair(accum[0], accum[1])
++                    result1 = self._pack_pair(accum[2], accum[3])
++                    result2 = self._pack_pair(accum[4], accum[5])
++                    result3 = self._pack_pair(accum[6], accum[7])
++                    st_global_v4_u32(
++                        (
++                            output
++                            + output_base * Int64(4)
++                            + Int64(pack) * Int64(4)
++                        ).toint(),
++                        result0,
++                        result1,
++                        result2,
++                        result3,
++                    )
+             row += warp_stride
+ 
+         if cutlass.const_expr(self._device_slot_selection):
+@@ -2476,7 +2623,7 @@ def _get_compiled_lse_reduce_scatter(
+         current_cuda_stream(),
+         compile_spec=KernelCompileSpec.from_key(
+             "comm.pcie.dcp_a2a.lse_reduce_scatter",
+-            36,
++            37,
+             key,
+             labels=(
+                 "world_size",
+diff --git a/b12x/comm/pcie/pcie_dcp_a2a.py b/b12x/comm/pcie/pcie_dcp_a2a.py
+index 577385b1..5acd7b2a 100644
+--- a/b12x/comm/pcie/pcie_dcp_a2a.py
++++ b/b12x/comm/pcie/pcie_dcp_a2a.py
+@@ -72,6 +72,23 @@ _PAIR_GATHER_BLOCK_LIMIT = 16
+ SUPPORTED_WORLD_SIZES = (2, 4, 8, 9, 16)
+ SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+ SUPPORTED_GATHER_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
++# Partial attention outputs may also arrive as FP32 from ranks that keep their
++# local attention output unrounded; such channels are laid out with
++# ``output_elem_bytes=4`` and the reduce writes BF16 (one rounding after an
++# FP64 accumulation) or FP32.
++SUPPORTED_PARTIAL_DTYPES = (*SUPPORTED_DTYPES, torch.float32)
++SUPPORTED_OUTPUT_ELEM_BYTES = (2, 4)
++
++
++def _lse_dtype_name(partial_dtype: torch.dtype, out_dtype: Optional[torch.dtype]) -> str:
++    """Kernel variant name for a partial dtype and its reduced output dtype."""
++    if partial_dtype == torch.float16:
++        return "fp16"
++    if partial_dtype == torch.bfloat16:
++        return "bf16"
++    if partial_dtype == torch.float32:
++        return "fp32x32" if out_dtype == torch.float32 else "fp32"
++    raise ValueError(f"unsupported partial output dtype {partial_dtype}")
+ SUPPORTED_PAIR_DTYPES = (*SUPPORTED_GATHER_DTYPES, torch.float32)
+ DCP_A2A_REQUIRED_SMS = 64
+ _MAX_BLOCKS = 64
+@@ -298,9 +315,12 @@ def _staging_layout(
+     total_heads: int,
+     head_dim: int,
+     query_head_dim: Optional[int] = None,
++    output_elem_bytes: int = 2,
+ ) -> _StagingLayout:
+     if signal_bytes <= 0:
+         raise ValueError("signal_bytes must be positive")
++    if output_elem_bytes not in SUPPORTED_OUTPUT_ELEM_BYTES:
++        raise ValueError("output_elem_bytes must be 2 or 4")
+     if world_size not in SUPPORTED_WORLD_SIZES:
+         raise ValueError(f"unsupported world size {world_size}")
+     if max_batch_size <= 0:
+@@ -314,8 +334,13 @@ def _staging_layout(
+     if query_head_dim <= 0 or query_head_dim % 8 != 0:
+         raise ValueError("query_head_dim must be a positive multiple of 8")
+ 
+-    output_elems = max_batch_size * total_heads * max(head_dim, query_head_dim)
+-    output_bytes = _align_up(output_elems * 2, IPC_SLAB_ALIGNMENT)
++    # A staging row holds one partial output head (head_dim x elem bytes) or
++    # one gathered query head (query_head_dim x 2 bytes). Capacity stays in
++    # 16-bit units so the 16-bit contracts are unchanged.
++    row_bytes = max(head_dim * output_elem_bytes, query_head_dim * 2)
++    output_bytes = _align_up(
++        max_batch_size * total_heads * row_bytes, IPC_SLAB_ALIGNMENT
++    )
+     output_capacity_elems = output_bytes // 2
+     lse_offset = output_bytes
+     lse_elems = max_batch_size * total_heads
+@@ -408,10 +433,14 @@ class PCIeDCPA2A:
+         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]] = None,
+         ext_module=None,
+         stream_affine: bool = True,
++        output_elem_bytes: int = 2,
+     ) -> None:
+         def normalize_and_validate():
+             device_obj = _normalize_device(device)
+             normalized_rank = int(rank)
++            normalized_output_elem_bytes = int(output_elem_bytes)
++            if normalized_output_elem_bytes not in SUPPORTED_OUTPUT_ELEM_BYTES:
++                raise ValueError("output_elem_bytes must be 2 or 4")
+             normalized_world_size = int(world_size)
+             normalized_signals = tuple(int(ptr) for ptr in signal_ptrs)
+             normalized_staging0 = tuple(int(ptr) for ptr in staging0_ptrs)
+@@ -452,7 +481,10 @@ class PCIeDCPA2A:
+             required_output = (
+                 normalized_max_batch
+                 * normalized_total_heads
+-                * max(normalized_head_dim, normalized_query_dim)
++                * max(
++                    normalized_head_dim * normalized_output_elem_bytes // 2,
++                    normalized_query_dim,
++                )
+             )
+             if normalized_output_capacity < required_output:
+                 raise ValueError("output capacity is smaller than configured shape")
+@@ -496,6 +528,7 @@ class PCIeDCPA2A:
+                 normalized_output_capacity,
+                 normalized_lse_offset,
+                 normalized_lse_capacity,
++                normalized_output_elem_bytes,
+             )
+ 
+         if exchange_group is not None:
+@@ -521,6 +554,7 @@ class PCIeDCPA2A:
+             prepared_output_capacity,
+             prepared_lse_offset,
+             prepared_lse_capacity,
++            prepared_output_elem_bytes,
+         ) = normalized
+         self._initialize_prepared_state(
+             rank=prepared_rank,
+@@ -541,6 +575,7 @@ class PCIeDCPA2A:
+             owned_buffers=owned_buffers,
+             ext_module=ext_module,
+             stream_affine=stream_affine,
++            output_elem_bytes=prepared_output_elem_bytes,
+         )
+ 
+         if self.device.type == "cuda":
+@@ -565,6 +600,7 @@ class PCIeDCPA2A:
+                     self.lse_offset,
+                     self.lse_capacity,
+                     self.gather_switch_groups,
++                    self.output_elem_bytes,
+                 ),
+             )
+ 
+@@ -607,6 +643,7 @@ class PCIeDCPA2A:
+         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
+         ext_module,
+         stream_affine: bool,
++        output_elem_bytes: int = 2,
+     ) -> None:
+         self.rank = int(rank)
+         self.world_size = int(world_size)
+@@ -617,6 +654,8 @@ class PCIeDCPA2A:
+         self.head_dim = int(head_dim)
+         self.query_head_dim = int(query_head_dim)
+         self.heads_per_rank = self.total_heads // self.world_size
++        self.output_elem_bytes = int(output_elem_bytes)
++        self._output_elem_bytes = int(output_elem_bytes)
+         self.output_capacity_elems = int(output_capacity_elems)
+         self.lse_offset = int(lse_offset)
+         self.lse_capacity = int(lse_capacity)
+@@ -715,11 +754,14 @@ class PCIeDCPA2A:
+         query_head_dim: Optional[int] = None,
+         ext_module=None,
+         stream_affine: bool = True,
++        output_elem_bytes: int = 2,
+     ) -> "PCIeDCPA2A":
+         rank = dist.get_rank(group=exchange_group)
+         world_size = dist.get_world_size(group=exchange_group)
+         def validate_factory_arguments():
+             device_obj = _normalize_device(device)
++            if int(output_elem_bytes) not in SUPPORTED_OUTPUT_ELEM_BYTES:
++                raise ValueError("output_elem_bytes must be 2 or 4")
+             normalized_max_batch = int(max_batch_size)
+             normalized_total_heads = int(total_heads)
+             normalized_head_dim = int(head_dim)
+@@ -779,6 +821,7 @@ class PCIeDCPA2A:
+                 total_heads=total_heads,
+                 head_dim=head_dim,
+                 query_head_dim=query_head_dim,
++                output_elem_bytes=int(output_elem_bytes),
+             )
+             return prepared_ipc, layout
+ 
+@@ -799,6 +842,7 @@ class PCIeDCPA2A:
+                 a2a_transport(),
+                 a2a_pair_transport(a2a_transport()),
+                 a2a_gather_switch_groups(world_size),
++                int(output_elem_bytes),
+             ),
+         )
+         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
+@@ -826,6 +870,7 @@ class PCIeDCPA2A:
+             owned_buffers=[slab],
+             ext_module=ext_module,
+             stream_affine=stream_affine,
++            output_elem_bytes=int(output_elem_bytes),
+         )
+ 
+         def abort_native_runtime() -> None:
+@@ -861,6 +906,7 @@ class PCIeDCPA2A:
+         query_head_dim: Optional[int] = None,
+         ext_module=None,
+         stream_affine: bool = True,
++        output_elem_bytes: int = 2,
+     ) -> "PCIeDCPA2A":
+         return cls.from_exchange_group(
+             exchange_group=process_group,
+@@ -868,6 +914,7 @@ class PCIeDCPA2A:
+             max_batch_size=max_batch_size,
+             total_heads=total_heads,
+             head_dim=head_dim,
++            output_elem_bytes=output_elem_bytes,
+             query_head_dim=query_head_dim,
+             ext_module=ext_module,
+             stream_affine=stream_affine,
+@@ -943,6 +990,7 @@ class PCIeDCPA2A:
+         *,
+         dtype: torch.dtype = torch.bfloat16,
+         threads: int = 256,
++        out_dtype: Optional[torch.dtype] = None,
+     ) -> None:
+         """Compile/load the LSE graph launcher before CUDA graph capture."""
+ 
+@@ -950,12 +998,14 @@ class PCIeDCPA2A:
+             raise RuntimeError(
+                 "prepare_graph_lse_reduce_scatter() must run before capture"
+             )
+-        if dtype not in SUPPORTED_DTYPES:
++        if dtype not in SUPPORTED_PARTIAL_DTYPES:
+             raise ValueError(f"unsupported output dtype {dtype}")
++        if dtype == torch.float32 and self._output_elem_bytes < 4:
++            raise ValueError("FP32 partials need a channel with output_elem_bytes=4")
+         threads, _ = self._resolve_launch_config(
+             threads=threads, block_limit=1, op="lse"
+         )
+-        dtype_name = "fp16" if dtype == torch.float16 else "bf16"
++        dtype_name = _lse_dtype_name(dtype, out_dtype)
+         from ._dcp_a2a_cute import _get_compiled_lse_reduce_scatter
+ 
+         with torch.cuda.device(self.device):
+@@ -1058,11 +1108,18 @@ class PCIeDCPA2A:
+             raise ValueError("inputs must be on the runtime device")
+         if out.device != self.device:
+             raise ValueError("output must be on the runtime device")
+-        if partial_output.dtype not in SUPPORTED_DTYPES:
++        if partial_output.dtype not in SUPPORTED_PARTIAL_DTYPES:
+             raise ValueError(f"unsupported output dtype {partial_output.dtype}")
+         if partial_lse.dtype != torch.float32:
+             raise ValueError("partial_lse must be float32")
+-        if out.dtype != partial_output.dtype:
++        if partial_output.dtype == torch.float32:
++            if self._output_elem_bytes < 4:
++                raise ValueError(
++                    "FP32 partial outputs need a channel with output_elem_bytes=4"
++                )
++            if out.dtype not in (torch.bfloat16, torch.float32):
++                raise ValueError("FP32 partials reduce to bfloat16 or float32 outputs")
++        elif out.dtype != partial_output.dtype:
+             raise ValueError("output dtype must match partial_output")
+         if partial_output.ndim != 3:
+             raise ValueError("partial_output must have shape [batch, heads, head_dim]")
+@@ -1078,7 +1135,8 @@ class PCIeDCPA2A:
+             )
+         if partial_lse.shape != (batch, heads):
+             raise ValueError("partial_lse must have shape [batch, heads]")
+-        if batch * heads * head_dim > self._output_capacity_elems:
++        staged_units = batch * heads * head_dim * (partial_output.element_size() // 2)
++        if staged_units > self._output_capacity_elems:
+             raise ValueError("PCIe DCP A2A staging capacity exceeded")
+         if batch * heads > self._lse_capacity:
+             raise ValueError("PCIe DCP A2A LSE staging capacity exceeded")
+@@ -1132,7 +1190,12 @@ class PCIeDCPA2A:
+                 self.heads_per_rank,
+                 self.head_dim,
+                 device=partial_output.device,
+-                dtype=partial_output.dtype,
++                # FP32 partials round once to BF16 after the FP64 combine.
++                dtype=(
++                    torch.bfloat16
++                    if partial_output.dtype == torch.float32
++                    else partial_output.dtype
++                ),
+             )
+         self._validate(partial_output, partial_lse, out)
+         threads, block_limit = self._resolve_launch_config(
+@@ -1147,7 +1210,7 @@ class PCIeDCPA2A:
+             min(block_limit, (rows + warps_per_block - 1) // warps_per_block),
+         )
+         capturing = _is_current_stream_capturing(self.device)
+-        dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
++        dtype_name = _lse_dtype_name(partial_output.dtype, out.dtype)
+         if capturing:
+             from ._dcp_a2a_cute import is_lse_reduce_scatter_prepared
+ 
+@@ -1197,7 +1260,10 @@ class PCIeDCPA2A:
+     ) -> None:
+         from ._dcp_a2a_cute import lse_reduce_scatter
+ 
+-        dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
++        dtype_name = _lse_dtype_name(partial_output.dtype, out.dtype)
++        # Strides are passed in 16-byte packs of the respective dtype.
++        in_pack = 16 // partial_output.element_size()
++        out_pack = 16 // out.element_size()
+         with torch.cuda.device(self.device):
+             lse_reduce_scatter(
+                 world_size=self.world_size,
+@@ -1213,10 +1279,10 @@ class PCIeDCPA2A:
+                 batch=int(partial_output.shape[0]),
+                 total_heads=self.total_heads,
+                 head_dim=self.head_dim,
+-                input_stride_batch=int(partial_output.stride(0)) // 8,
+-                input_stride_head=int(partial_output.stride(1)) // 8,
+-                output_stride_batch=int(out.stride(0)) // 8,
+-                output_stride_head=int(out.stride(1)) // 8,
++                input_stride_batch=int(partial_output.stride(0)) // in_pack,
++                input_stride_head=int(partial_output.stride(1)) // in_pack,
++                output_stride_batch=int(out.stride(0)) // out_pack,
++                output_stride_head=int(out.stride(1)) // out_pack,
+                 natural_log=natural_log,
+                 device_slot_selection=device_slot_selection,
+                 slot_delta_bytes=(
+@@ -2019,11 +2085,14 @@ class PCIeDCPA2APool:
+         single_channel: bool = False,
+         max_concurrent_channels: int = 1,
+         channel_factory: Optional[Callable[[Optional[int]], PCIeDCPA2A]] = None,
++        output_elem_bytes: int = 2,
+     ) -> None:
+         def normalize_and_validate():
+             normalized_rank = int(rank)
+             normalized_world_size = int(world_size)
+             device_obj = _normalize_device(device)
++            if int(output_elem_bytes) not in SUPPORTED_OUTPUT_ELEM_BYTES:
++                raise ValueError("output_elem_bytes must be 2 or 4")
+             normalized_max_batch = int(max_batch_size)
+             normalized_total_heads = int(total_heads)
+             normalized_head_dim = int(head_dim)
+@@ -2102,6 +2171,7 @@ class PCIeDCPA2APool:
+             self.single_channel,
+             self.max_concurrent_channels,
+         ) = normalized
++        self.output_elem_bytes = int(output_elem_bytes)
+         self.exchange_group = exchange_group
+         self._legacy_ext_module = ext_module
+         self.single_channel = bool(single_channel)
+@@ -2141,6 +2211,7 @@ class PCIeDCPA2APool:
+         ext_module=None,
+         single_channel: bool = False,
+         max_concurrent_channels: int = 1,
++        output_elem_bytes: int = 2,
+     ) -> "PCIeDCPA2APool":
+         return cls(
+             rank=dist.get_rank(group=exchange_group),
+@@ -2154,6 +2225,7 @@ class PCIeDCPA2APool:
+             ext_module=ext_module,
+             single_channel=single_channel,
+             max_concurrent_channels=max_concurrent_channels,
++            output_elem_bytes=output_elem_bytes,
+         )
+ 
+     @classmethod
+@@ -2169,6 +2241,7 @@ class PCIeDCPA2APool:
+         ext_module=None,
+         single_channel: bool = False,
+         max_concurrent_channels: int = 1,
++        output_elem_bytes: int = 2,
+     ) -> "PCIeDCPA2APool":
+         return cls.from_exchange_group(
+             exchange_group=process_group,
+@@ -2180,6 +2253,7 @@ class PCIeDCPA2APool:
+             ext_module=ext_module,
+             single_channel=single_channel,
+             max_concurrent_channels=max_concurrent_channels,
++            output_elem_bytes=output_elem_bytes,
+         )
+ 
+     def _new_channel(self, stream_key: Optional[int]) -> PCIeDCPA2A:
+@@ -2196,6 +2270,7 @@ class PCIeDCPA2APool:
+                 query_head_dim=self.query_head_dim,
+                 ext_module=self._legacy_ext_module,
+                 stream_affine=not self.single_channel,
++                output_elem_bytes=self.output_elem_bytes,
+             )
+         channel._bind_stream_key(stream_key)
+         self._all_channels.append(channel)
+@@ -2388,12 +2463,13 @@ class PCIeDCPA2APool:
+         threads: int = 256,
+         stream: object = None,
+         channel_id: Optional[str] = None,
++        out_dtype: Optional[torch.dtype] = None,
+     ) -> None:
+         """Prepare LSE graph code on an eager channel before capture."""
+ 
+         with _device_guard(self.device):
+             self.for_stream(stream, channel_id=channel_id).prepare_graph_lse_reduce_scatter(
+-                dtype=dtype, threads=threads
++                dtype=dtype, threads=threads, out_dtype=out_dtype
+             )
+ 
+     def prepare_graph_all_gather_heads(
+diff --git a/tests/comm/test_pcie_dcp_a2a.py b/tests/comm/test_pcie_dcp_a2a.py
+index 1b788f3d..177852e5 100644
+--- a/tests/comm/test_pcie_dcp_a2a.py
++++ b/tests/comm/test_pcie_dcp_a2a.py
+@@ -241,6 +241,42 @@ def test_staging_layout_has_aligned_disjoint_slots():
+     assert wider_query_layout.output_capacity_elems >= 4 * 32 * 576
+     assert wider_query_layout.lse_offset > layout.lse_offset
+ 
++    # FP32 partial rows (512 x 4 B) need twice the 16-bit capacity of the
++    # 512-wide BF16 rows and more than the 576-wide BF16 query rows.
++    fp32_layout = _staging_layout(
++        signal_bytes=12345,
++        world_size=2,
++        max_batch_size=4,
++        total_heads=32,
++        head_dim=512,
++        query_head_dim=576,
++        output_elem_bytes=4,
++    )
++    assert fp32_layout.output_capacity_elems >= 4 * 32 * 512 * 2
++    assert fp32_layout.output_capacity_elems >= wider_query_layout.output_capacity_elems
++    assert fp32_layout.lse_offset > wider_query_layout.lse_offset
++    with pytest.raises(ValueError):
++        _staging_layout(
++            signal_bytes=12345,
++            world_size=2,
++            max_batch_size=4,
++            total_heads=32,
++            head_dim=512,
++            output_elem_bytes=3,
++        )
++
++
++def test_lse_dtype_name_selects_fp32_variants():
++    from b12x.comm.pcie.pcie_dcp_a2a import _lse_dtype_name
++
++    assert _lse_dtype_name(torch.bfloat16, None) == "bf16"
++    assert _lse_dtype_name(torch.float16, torch.float16) == "fp16"
++    assert _lse_dtype_name(torch.float32, torch.bfloat16) == "fp32"
++    assert _lse_dtype_name(torch.float32, None) == "fp32"
++    assert _lse_dtype_name(torch.float32, torch.float32) == "fp32x32"
++    with pytest.raises(ValueError):
++        _lse_dtype_name(torch.int32, None)
++
+ 
+ def test_graph_epoch_uses_only_barrier_record_padding() -> None:
+     from b12x.comm.pcie import _dcp_a2a_cute as kernels
+@@ -287,12 +323,12 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
+         (
+             kernels._get_compiled_lse_reduce_scatter,
+             "comm.pcie.dcp_a2a.lse_reduce_scatter",
+-            36,
++            37,
+         ),
+         (
+             kernels._get_compiled_all_gather_heads,
+             "comm.pcie.dcp_a2a.all_gather_heads",
+-            13,
++            14,
+         ),
+     )
+     for launcher, identity, version in identities:
+diff --git a/tests/comm/test_pcie_dcp_a2a_gpu.py b/tests/comm/test_pcie_dcp_a2a_gpu.py
+index 0ca2c8f7..5e0a5f0d 100644
+--- a/tests/comm/test_pcie_dcp_a2a_gpu.py
++++ b/tests/comm/test_pcie_dcp_a2a_gpu.py
+@@ -414,6 +414,163 @@ def _check_eager(
+         )
+ 
+ 
++def _fp32_reference(
++    partial_outputs: torch.Tensor,
++    partial_lses: torch.Tensor,
++    rank: int,
++    out_dtype: torch.dtype,
++) -> torch.Tensor:
++    """FP32 weights (as the kernel computes them) applied to the stacked FP32
++    partials with FP64 accumulation, rounded once to ``out_dtype``."""
++    world_size, _, total_heads, _ = partial_outputs.shape
++    heads_per_rank = total_heads // world_size
++    head_slice = slice(rank * heads_per_rank, (rank + 1) * heads_per_rank)
++    outputs = partial_outputs[:, :, head_slice, :].double()
++    lses = partial_lses[:, :, head_slice].float()
++    valid = torch.isfinite(lses)
++    sanitized = torch.where(valid, lses, torch.full_like(lses, -torch.inf))
++    max_lse = sanitized.amax(dim=0)
++    max_lse = torch.where(torch.isfinite(max_lse), max_lse, 0.0)
++    weights = torch.exp(sanitized - max_lse.unsqueeze(0))
++    weights = torch.where(valid, weights, torch.zeros_like(weights))
++    inv_sum = 1.0 / weights.sum(dim=0, keepdim=True).clamp_min(1e-10)
++    normalized = (weights * inv_sum).double()
++    outputs = torch.where(valid.unsqueeze(-1), outputs, torch.zeros_like(outputs))
++    return (outputs * normalized.unsqueeze(-1)).sum(dim=0).to(out_dtype)
++
++
++def _check_fp32_partials(
++    rank: int,
++    world_size: int,
++    device: torch.device,
++) -> None:
++    """FP32 partial outputs on a 4-byte channel: eager and graph replay.
++
++    The kernel accumulates in FP64 and rounds once, so against an FP64
++    reference it must be at least as close as an FP32-accumulated BF16 path;
++    the test checks a tight tolerance plus exact agreement on most elements.
++    """
++    pool = PCIeDCPA2APool.from_process_group(
++        process_group=dist.group.WORLD,
++        device=device,
++        max_batch_size=16,
++        total_heads=TOTAL_HEADS,
++        head_dim=HEAD_DIM,
++        query_head_dim=QUERY_HEAD_DIM,
++        max_concurrent_channels=2,
++        output_elem_bytes=4,
++    )
++    try:
++        pool.prepare_channels(("eager:fp32", "graph:fp32"))
++        pool.prepare_graph_lse_reduce_scatter(
++            dtype=torch.float32, out_dtype=torch.bfloat16, channel_id="eager:fp32"
++        )
++        for step, batch in enumerate((1, 2, 4, 8, 16), start=300):
++            partial_output, partial_lse = _rank_inputs(
++                step, rank, batch, torch.float32, device
++            )
++            # A few empty shards (non-finite LSE) must contribute zero weight.
++            if step % 2 == 0:
++                partial_lse[:, rank::world_size] = float("-inf")
++            stacked = torch.stack(
++                [_rank_inputs(step, source, batch, torch.float32, device)[0] for source in range(world_size)]
++            )
++            stacked_lse = torch.stack(
++                [_rank_inputs(step, source, batch, torch.float32, device)[1] for source in range(world_size)]
++            )
++            if step % 2 == 0:
++                for source in range(world_size):
++                    stacked_lse[source][:, source::world_size] = float("-inf")
++            for out_dtype in (torch.bfloat16, torch.float32):
++                out = torch.empty(
++                    batch, TOTAL_HEADS // world_size, HEAD_DIM, dtype=out_dtype, device=device
++                )
++                actual = pool.lse_reduce_scatter(
++                    partial_output, partial_lse, out=out, channel_id="eager:fp32"
++                )
++                torch.cuda.synchronize(device)
++                assert actual is out
++                expected = _fp32_reference(stacked, stacked_lse, rank, out_dtype)
++                if out_dtype == torch.bfloat16:
++                    # One rounding of an FP64 sum: agree with the reference
++                    # bitwise except where the FP32 weights (expf, sum order)
++                    # differ by an ulp between the kernel and torch.
++                    torch.testing.assert_close(
++                        actual.float(), expected.float(), rtol=4e-3, atol=4e-3
++                    )
++                    exact = (actual.view(torch.int16) == expected.view(torch.int16)).float().mean().item()
++                    assert exact > 0.98, f"fp32 partial combine exact fraction {exact} (rank {rank}, batch {batch})"
++                else:
++                    # FP32 outputs expose those weight ulps; require FP32-level
++                    # agreement rather than bit identity.
++                    torch.testing.assert_close(
++                        actual, expected, rtol=1e-5, atol=1e-6
++                    )
++                # The 16-bit reference path (FP32 accumulate of BF16-rounded
++                # partials) must not be closer to the FP64 truth than this kernel.
++                if out_dtype == torch.bfloat16:
++                    truth = _fp32_reference(stacked, stacked_lse, rank, torch.float64)
++                    bf16_path = lse_reduce_scatter_reference(
++                        stacked.to(torch.bfloat16), stacked_lse, rank
++                    )
++                    kernel_err = (actual.double() - truth).abs().mean().item()
++                    bf16_err = (bf16_path.double() - truth).abs().mean().item()
++                    assert kernel_err <= bf16_err * 1.05 + 1e-7, (kernel_err, bf16_err)
++            # Head-major capacity-strided input layout, as produced by the
++            # B12X sparse MLA scratch.
++            storage = torch.empty(TOTAL_HEADS, 16, HEAD_DIM, dtype=torch.float32, device=device)
++            head_major = storage.transpose(0, 1)[:batch]
++            head_major.copy_(partial_output)
++            out = torch.empty(batch, TOTAL_HEADS // world_size, HEAD_DIM, dtype=torch.bfloat16, device=device)
++            pool.lse_reduce_scatter(head_major, partial_lse, out=out, channel_id="eager:fp32")
++            torch.cuda.synchronize(device)
++            expected = _fp32_reference(stacked, stacked_lse, rank, torch.bfloat16)
++            torch.testing.assert_close(out.float(), expected.float(), rtol=4e-3, atol=4e-3)
++        dist.barrier()
++
++        # Graph replay with changing inputs.
++        stream = torch.cuda.Stream(device=device)
++        channel = pool.for_stream(stream, channel_id="graph:fp32")
++        batch = 4
++        graph_input = torch.empty(batch, TOTAL_HEADS, HEAD_DIM, dtype=torch.float32, device=device)
++        graph_lse = torch.empty(batch, TOTAL_HEADS, dtype=torch.float32, device=device)
++        graph_out = torch.empty(batch, TOTAL_HEADS // world_size, HEAD_DIM, dtype=torch.bfloat16, device=device)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.stream(stream):
++            initial_output, initial_lse = _rank_inputs(400, rank, batch, torch.float32, device)
++            graph_input.copy_(initial_output)
++            graph_lse.copy_(initial_lse)
++            torch.cuda.synchronize(device)
++            dist.barrier()
++            with pool.capture(stream, channel_id="graph:fp32"):
++                with torch.cuda.graph(graph, stream=stream):
++                    channel.lse_reduce_scatter(graph_input, graph_lse, out=graph_out)
++        torch.cuda.synchronize(device)
++        dist.barrier()
++        for step in (401, 402, 403):
++            replay_output, replay_lse = _rank_inputs(step, rank, batch, torch.float32, device)
++            graph_input.copy_(replay_output)
++            graph_lse.copy_(replay_lse)
++            torch.cuda.synchronize(device)
++            dist.barrier()
++            graph.replay()
++            torch.cuda.synchronize(device)
++            stacked = torch.stack(
++                [_rank_inputs(step, source, batch, torch.float32, device)[0] for source in range(world_size)]
++            )
++            stacked_lse = torch.stack(
++                [_rank_inputs(step, source, batch, torch.float32, device)[1] for source in range(world_size)]
++            )
++            expected = _fp32_reference(stacked, stacked_lse, rank, torch.bfloat16)
++            torch.testing.assert_close(graph_out.float(), expected.float(), rtol=4e-3, atol=4e-3)
++            dist.barrier()
++        graph.reset()
++        torch.cuda.synchronize(device)
++        dist.barrier()
++    finally:
++        pool.close()
++
++
+ def _check_eager_adjacency(
+     pool: PCIeDCPA2APool,
+     rank: int,
+@@ -1271,6 +1428,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
+         _stage(rank, "pair_graph")
+         _check_pair_graph(pool, rank, world_size, device)
+         dist.barrier()
++        # FP32 partial outputs use their own 4-byte channel layout.
++        _stage(rank, "fp32_partials")
++        _check_fp32_partials(rank, world_size, device)
++        dist.barrier()
+         # The fused Kimi router path needs its own pool (Kimi row widths).
+         _stage(rank, "pair_kimi_topk")
+         _check_pair_kimi_topk(rank, world_size, device)

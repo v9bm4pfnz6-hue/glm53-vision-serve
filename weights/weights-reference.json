@@ -1,0 +1,17 @@
+{
+  "text_model_repo": "zai-org/GLM-5.3",
+  "text_model_revision": "ba32f8c19c8738e2c57c71798c601d477a7bf844",
+  "vision_components_repo": "lunaroute/GLM-5.3-Vision-FP8",
+  "config_sha256": "2c63175c87867736e36e4aca89942687c0170aac2560f8ddf1daa44dcd5cc9d7",
+  "vision_files_sha256": {
+    "chat_template.jinja": "9bfc0f5f58d712cd270e1595a7959088bb911f59b113419a4223d3f89e47afe8",
+    "generation_config.json": "ac76b43d8683d3b930126870fc8be73d8679308fe752fa1f381096d8354f6a55",
+    "mm_projector.safetensors": "e7c6ce8c27424f292e708e7bbb48ade57ea9f1aaddd28bd6a1020a860d9db80c",
+    "model.safetensors.index.json": "027a8674d27935ea49158d2a61b561fac0f8731136ddff3881543ef5cec6423a",
+    "preprocessor_config.json": "b938c8d816d50579bd8d9bba2ff0ffb738c528b9b05c6966c186d30a1a065041",
+    "tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+    "tokenizer_config.json": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+    "vision_tower.safetensors": "af1c927919bd073c2ab893bf2c6d9826100a06828c3b40f0128fabb4660a610d"
+  },
+  "text_shard_count": 141
+}

@@ -1,0 +1,23 @@
+# GLM-5.3-Vision serving container — docker compose variant of run.sh.
+# Set WEIGHTS_DIR before use; see weights/assemble_weights.py for assembly.
+services:
+  glm53-vision:
+    image: ghcr.io/v9bm4pfnz6-hue/glm53-vision-serve:20261031
+    container_name: glm53-vision
+    network_mode: host
+    restart: unless-stopped
+    shm_size: 16g
+    environment:
+      # Production pins 1,2,3,4,5,6,7,8,0 so DCP ranks 0-3,8 share one PCIe
+      # switch chip and ranks 4-7 the other; adjust to your topology.
+      CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7,8
+    volumes:
+      - ${WEIGHTS_DIR:?set WEIGHTS_DIR to the assembled composite weights dir}:/model:ro
+      - ./glm53-vision-cache:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
